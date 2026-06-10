@@ -1,13 +1,40 @@
 use std::{env, process};
 
-use grim_rs::{CaptureParameters, Grim};
-use hyprland::{data::CursorPosition, prelude::*};
+use grim_rs::Grim;
+use hyprland::{
+    data::{CursorPosition, Monitors},
+    prelude::*,
+};
 use raylib::{
-    ffi::{Image as FfiImage, SetWindowMonitor, ToggleFullscreen},
+    ffi,
+    ffi::{Image as FfiImage, SetWindowMonitor},
     prelude::*,
 };
 
 const SPOTLIGHT_TINT: Color = Color::new(0x00, 0x00, 0x00, 190);
+
+/// Look up the fractional scale Hyprland applies to the given output.
+///
+/// A fullscreen surface is sized in *logical* pixels (e.g. 1280x720 at scale
+/// 1.5) but is backed by a device-pixel GL buffer at the monitor's native
+/// resolution (logical * scale = 1920x1080). raylib only discovers that buffer
+/// size when `FLAG_WINDOW_HIGHDPI` is set, and that flag is broken on this
+/// GLFW/Wayland build (it reports a garbage framebuffer size). So raylib leaves
+/// its GL viewport at the logical size, anchored bottom-left, and our content
+/// only covers the bottom-left ~2/3 of the screen. We use this scale to size the
+/// viewport to the real device buffer ourselves.
+fn output_scale(output_name: &str) -> f32 {
+    Monitors::get()
+        .ok()
+        .and_then(|monitors| {
+            monitors
+                .into_iter()
+                .find(|m| m.name == output_name)
+                .map(|m| m.scale)
+        })
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0)
+}
 
 fn get_initial_cursor_pos_for_output(
     out_x: i32,
@@ -62,7 +89,7 @@ fn main() {
             }),
     };
 
-    let mut spotlight_mouse_position = get_initial_cursor_pos_for_output(
+    let spotlight_mouse_position_logical = get_initial_cursor_pos_for_output(
         selected_output.geometry().x(),
         selected_output.geometry().y(),
         selected_output.geometry().width() as i32,
@@ -73,75 +100,40 @@ fn main() {
         selected_output.geometry().height() as f32 * 0.5,
     ));
 
-    let params: Vec<CaptureParameters> = outputs
-        .iter()
-        .map(|out| CaptureParameters::new(out.name()).overlay_cursor(false))
-        .collect();
+    let screenshot = grim
+        .capture_output(selected_output.name())
+        .expect("failed to capture output");
+    // `grim` captures at the output's full device pixel resolution, which on a
+    // fractionally-scaled output is even larger than the monitor's mode (e.g.
+    // 2880x1620 for a 1920x1080 panel at scale 1.5). We keep this full-res
+    // texture for crisp zooming and just draw it scaled to the logical window.
+    let capture_width = screenshot.width();
+    let capture_height = screenshot.height();
+    let raw_pixels = screenshot.into_data();
 
-    let results = grim
-        .capture_outputs(params)
-        .expect("failed to capture outputs");
+    // Hyprland always sizes a fullscreen surface to the output's *logical* size
+    // (e.g. 1280x720 for a 1920x1080 panel at scale 1.5), and that logical space
+    // is also where it reports the mouse. We request the window at that logical
+    // size and drive all drawing, mouse handling and the shader in logical units;
+    // the only catch (the real device framebuffer being larger) is fixed up by
+    // overriding the GL viewport with the device framebuffer size each frame.
+    let logical_width = selected_output.geometry().width() as i32;
+    let logical_height = selected_output.geometry().height() as i32;
 
-    // Compute the bounding box of all outputs in layout space.
-    let min_x = outputs
-        .iter()
-        .map(|o| o.geometry().x())
-        .min()
-        .expect("no outputs");
-    let min_y = outputs
-        .iter()
-        .map(|o| o.geometry().y())
-        .min()
-        .expect("no outputs");
-    let max_x = outputs
-        .iter()
-        .map(|o| o.geometry().x() + o.geometry().width() as i32)
-        .max()
-        .expect("no outputs");
-    let max_y = outputs
-        .iter()
-        .map(|o| o.geometry().y() + o.geometry().height() as i32)
-        .max()
-        .expect("no outputs");
+    // Real device-pixel framebuffer backing the fullscreen surface.
+    let scale = output_scale(selected_output.name());
+    let fb_width = (logical_width as f32 * scale).round() as i32;
+    let fb_height = (logical_height as f32 * scale).round() as i32;
 
-    let width = (max_x - min_x) as u32;
-    let height = (max_y - min_y) as u32;
-
-    // RGBA canvas
-    let mut raw_pixels = vec![0u8; (width * height * 4) as usize];
-
-    for output in outputs.iter() {
-        let result = results
-            .get(output.name())
-            .expect("missing capture result for output");
-
-        let ox = (output.geometry().x() - min_x) as u32;
-        let oy = (output.geometry().y() - min_y) as u32;
-
-        let out_w = result.width() as u32;
-        let out_h = result.height() as u32;
-        let src = result.data();
-
-        for row in 0..out_h {
-            let dst_start = (((oy + row) * width + ox) * 4) as usize;
-            let dst_end = dst_start + (out_w * 4) as usize;
-
-            let src_start = (row * out_w * 4) as usize;
-            let src_end = src_start + (out_w * 4) as usize;
-
-            raw_pixels[dst_start..dst_end].copy_from_slice(&src[src_start..src_end]);
-        }
-    }
+    // The initial cursor position is already in logical (output-local) space.
+    let mut spotlight_mouse_position = spotlight_mouse_position_logical;
 
     let (mut rl, thread) = raylib::init()
         .title(env!("CARGO_BIN_NAME"))
-        // .size(width as i32, height as i32)
-        .size(
-            selected_output.geometry().width() as i32,
-            selected_output.geometry().height() as i32,
-        )
+        .size(logical_width, logical_height)
         .transparent()
         .undecorated()
+        .fullscreen()
         .vsync()
         .build();
 
@@ -149,10 +141,6 @@ fn main() {
         .iter()
         .position(|o| o.name() == selected_output.name())
         .expect("Monitor not found");
-
-    unsafe {
-        ToggleFullscreen();
-    }
 
     unsafe {
         SetWindowMonitor(idx as i32);
@@ -164,14 +152,20 @@ fn main() {
             data: Box::new(raw_pixels).leak().as_mut_ptr().cast(),
             format: PixelFormat::PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 as i32,
             mipmaps: 1,
-            width: width as i32,
-            height: height as i32,
+            width: capture_width as i32,
+            height: capture_height as i32,
         })
     };
 
     let screenshot_texture = rl
         .load_texture_from_image(&thread, &screenshot_image)
         .expect("failed to load screenshot into a texture");
+
+    // Draw the full-resolution capture stretched into the logical window; the
+    // enlarged GL viewport (see the loop below) then scales that up to the real
+    // device framebuffer so it fills the whole screen and stays sharp.
+    let texture_src = Rectangle::new(0.0, 0.0, capture_width as f32, capture_height as f32);
+    let texture_dst = Rectangle::new(0.0, 0.0, logical_width as f32, logical_height as f32);
 
     #[cfg(feature = "dev")]
     let mut spotlight_shader = rl
@@ -184,10 +178,6 @@ fn main() {
 
     let mut rl_camera = Camera2D::default();
     rl_camera.zoom = 1.0;
-    rl_camera.target = Vector2::new(
-        (selected_output.geometry().x() - min_x) as f32,
-        (selected_output.geometry().y() - min_y) as f32,
-    );
 
     let mut delta_scale = 0f64;
     let mut scale_pivot = rl.get_mouse_position();
@@ -202,35 +192,43 @@ fn main() {
     let mut cursor_position_uniform_location;
     #[cfg(feature = "dev")]
     let mut spotlight_radius_multiplier_uniform_location;
+    #[cfg(feature = "dev")]
+    let mut camera_zoom_uniform_location;
+    #[cfg(feature = "dev")]
+    let mut texture_size_uniform_location;
     #[cfg(not(feature = "dev"))]
     let spotlight_tint_uniform_location;
     #[cfg(not(feature = "dev"))]
     let cursor_position_uniform_location;
     #[cfg(not(feature = "dev"))]
     let spotlight_radius_multiplier_uniform_location;
+    #[cfg(not(feature = "dev"))]
+    let camera_zoom_uniform_location;
+    #[cfg(not(feature = "dev"))]
+    let texture_size_uniform_location;
 
     spotlight_tint_uniform_location = spotlight_shader.get_shader_location("spotlightTint");
     cursor_position_uniform_location = spotlight_shader.get_shader_location("cursorPosition");
     spotlight_radius_multiplier_uniform_location =
         spotlight_shader.get_shader_location("spotlightRadiusMultiplier");
-
-    let idx = outputs
-        .iter()
-        .position(|o| o.name() == selected_output.name())
-        .expect("Monitor not found");
-
-    unsafe {
-        ToggleFullscreen();
-        SetWindowMonitor(idx as i32);
-    }
+    camera_zoom_uniform_location = spotlight_shader.get_shader_location("cameraZoom");
+    texture_size_uniform_location = spotlight_shader.get_shader_location("textureSize");
 
     // Draw one fully-populated frame immediately so the first visible frame
     // is the screenshot, not an empty/unstyled window.
     {
         let mut d = rl.begin_drawing(&thread);
+        unsafe { ffi::rlViewport(0, 0, fb_width, fb_height) };
         let mut mode2d = d.begin_mode2D(rl_camera);
         mode2d.clear_background(Color::get_color(0));
-        mode2d.draw_texture(&screenshot_texture, 0, 0, Color::WHITE);
+        mode2d.draw_texture_pro(
+            &screenshot_texture,
+            texture_src,
+            texture_dst,
+            Vector2::zero(),
+            0.0,
+            Color::WHITE,
+        );
     }
 
     let mut should_exit = false;
@@ -253,6 +251,8 @@ fn main() {
                 spotlight_shader.get_shader_location("cursorPosition");
             spotlight_radius_multiplier_uniform_location =
                 spotlight_shader.get_shader_location("spotlightRadiusMultiplier");
+            camera_zoom_uniform_location = spotlight_shader.get_shader_location("cameraZoom");
+            texture_size_uniform_location = spotlight_shader.get_shader_location("textureSize");
         }
 
         let enable_spotlight = rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
@@ -296,8 +296,8 @@ fn main() {
 
         if delta_scale.abs() > 0.5 {
             let p0 = scale_pivot / rl_camera.zoom;
-            rl_camera.zoom = (rl_camera.zoom as f64 + delta_scale * frame_time as f64)
-                .clamp(1.0, 10.0) as f32;
+            rl_camera.zoom =
+                (rl_camera.zoom as f64 + delta_scale * frame_time as f64).clamp(1.0, 10.0) as f32;
             let p1 = scale_pivot / rl_camera.zoom;
             rl_camera.target += p0 - p1;
             delta_scale -= delta_scale * frame_time as f64 * 4.0;
@@ -312,10 +312,9 @@ fn main() {
 
         const VELOCITY_THRESHOLD: f32 = 15.0;
         if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
-            let delta = rl.get_screen_to_world2D(
-                rl.get_mouse_position() - rl.get_mouse_delta(),
-                rl_camera,
-            ) - rl.get_screen_to_world2D(rl.get_mouse_position(), rl_camera);
+            let delta = rl
+                .get_screen_to_world2D(rl.get_mouse_position() - rl.get_mouse_delta(), rl_camera)
+                - rl.get_screen_to_world2D(rl.get_mouse_position(), rl_camera);
 
             rl_camera.target += delta;
             velocity = delta * rl.get_fps().as_f32();
@@ -324,17 +323,21 @@ fn main() {
             velocity -= velocity * frame_time * 6.0;
         }
 
+        if rl.is_cursor_on_screen() {
+            spotlight_mouse_position = rl.get_screen_to_world2D(rl.get_mouse_position(), rl_camera);
+        }
+
         let mut d = rl.begin_drawing(&thread);
+        // raylib leaves its GL viewport at the logical screen size; on a
+        // fractionally-scaled output the real framebuffer is larger, so force
+        // the viewport to cover it (re-asserted each frame in case a compositor
+        // resize event reset it). Projection stays logical, so the scene simply
+        // scales up to fill the screen.
+        unsafe { ffi::rlViewport(0, 0, fb_width, fb_height) };
         let mut mode2d = d.begin_mode2D(rl_camera);
 
         if enable_spotlight || spotlight_opacity > 0.001 {
             mode2d.clear_background(Color::get_color(0));
-
-            let current_mouse_position = mode2d.get_mouse_position();
-
-            if current_mouse_position.x != 0.0 || current_mouse_position.y != 0.0 {
-                spotlight_mouse_position = current_mouse_position;
-            }
 
             let mouse_position = spotlight_mouse_position;
 
@@ -348,22 +351,43 @@ fn main() {
                 ),
             );
 
-            let screen_height = mode2d.get_screen_height().as_f32();
             spotlight_shader.set_shader_value(
                 cursor_position_uniform_location,
-                Vector2::new(mouse_position.x, screen_height - mouse_position.y),
+                Vector2::new(mouse_position.x, mouse_position.y),
             );
 
             spotlight_shader.set_shader_value(
                 spotlight_radius_multiplier_uniform_location,
                 spotlight_radius_multiplier,
             );
+            spotlight_shader.set_shader_value(camera_zoom_uniform_location, rl_camera.zoom);
+            // `fragTexCoord * textureSize` must land in the same logical space
+            // as `cursorPosition` (raylib's world space), so use the logical
+            // window size, not the raw capture size.
+            spotlight_shader.set_shader_value(
+                texture_size_uniform_location,
+                Vector2::new(logical_width as f32, logical_height as f32),
+            );
 
             let mut shader_mode = mode2d.begin_shader_mode(&mut spotlight_shader);
-            shader_mode.draw_texture(&screenshot_texture, 0, 0, Color::WHITE);
+            shader_mode.draw_texture_pro(
+                &screenshot_texture,
+                texture_src,
+                texture_dst,
+                Vector2::zero(),
+                0.0,
+                Color::WHITE,
+            );
         } else {
             mode2d.clear_background(Color::get_color(0));
-            mode2d.draw_texture(&screenshot_texture, 0, 0, Color::WHITE);
+            mode2d.draw_texture_pro(
+                &screenshot_texture,
+                texture_src,
+                texture_dst,
+                Vector2::zero(),
+                0.0,
+                Color::WHITE,
+            );
         }
     }
 }
