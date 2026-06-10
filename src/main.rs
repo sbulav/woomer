@@ -21,10 +21,12 @@ const SPOTLIGHT_TINT: Color = Color::new(0x00, 0x00, 0x00, 190);
 /// renders 1:1 into device pixels (a logical-unit coordinate lands on the device
 /// pixel of the same number) but leaves its GL viewport at the *logical* size,
 /// so our scene only covers the bottom-left ~2/3 of the buffer. We use this
-/// scale both to widen the viewport to the real device buffer and to express all
-/// geometry, mouse input and shader uniforms in device pixels so everything
-/// stays aligned. (`FLAG_WINDOW_HIGHDPI` would normally surface the device size
-/// but is broken here — it reports a garbage framebuffer.)
+/// scale to widen the viewport to the real device buffer and to size the
+/// geometry and shader uniforms in device pixels so everything stays aligned.
+/// (`get_mouse_position` already reports device pixels on this build, so live
+/// cursor reads are used as-is; only Hyprland's logical `cursorpos` is scaled.)
+/// (`FLAG_WINDOW_HIGHDPI` would normally surface the device size but is broken
+/// here — it reports a garbage framebuffer.)
 fn output_scale(output_name: &str) -> f32 {
     Monitors::get()
         .ok()
@@ -126,8 +128,10 @@ fn main() {
     let fb_width = (logical_width as f32 * scale).round() as i32;
     let fb_height = (logical_height as f32 * scale).round() as i32;
 
-    // Everything downstream works in device pixels (see `output_scale`), so lift
-    // the logical-space initial cursor into that space too.
+    // Everything downstream works in device pixels (see `output_scale`).
+    // `get_mouse_position` already reports device pixels on this GLFW/Wayland
+    // build, so live cursor reads need no conversion; only this initial position,
+    // which comes from Hyprland's *logical* `cursorpos`, must be lifted to device.
     let mut spotlight_mouse_position = spotlight_mouse_position_logical * scale;
 
     let (mut rl, thread) = raylib::init()
@@ -181,7 +185,7 @@ fn main() {
     rl_camera.zoom = 1.0;
 
     let mut delta_scale = 0f64;
-    let mut scale_pivot = rl.get_mouse_position() * scale;
+    let mut scale_pivot = rl.get_mouse_position();
     let mut velocity = Vector2::default();
     let mut spotlight_radius_multiplier = 1.0;
     let mut spotlight_radius_multiplier_delta = 0.0;
@@ -315,8 +319,8 @@ fn main() {
 
         const VELOCITY_THRESHOLD: f32 = 15.0;
         if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
-            let mouse = rl.get_mouse_position() * scale;
-            let prev_mouse = (rl.get_mouse_position() - rl.get_mouse_delta()) * scale;
+            let mouse = rl.get_mouse_position();
+            let prev_mouse = rl.get_mouse_position() - rl.get_mouse_delta();
             let delta = rl.get_screen_to_world2D(prev_mouse, rl_camera)
                 - rl.get_screen_to_world2D(mouse, rl_camera);
 
@@ -329,7 +333,7 @@ fn main() {
 
         if rl.is_cursor_on_screen() {
             spotlight_mouse_position =
-                rl.get_screen_to_world2D(rl.get_mouse_position() * scale, rl_camera);
+                rl.get_screen_to_world2D(rl.get_mouse_position(), rl_camera);
         }
 
         let mut d = rl.begin_drawing(&thread);
