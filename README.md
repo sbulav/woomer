@@ -1,8 +1,23 @@
 # Woomer - Boomer but for wayland
 
-Zoomer application for wayland (linux) inspired by [tsoding's boomer](https://github.com/tsoding/boomer) written in rust
+Zoomer application for wayland (linux) inspired by [tsoding's boomer](https://github.com/tsoding/boomer) written in rust.
 
-![demo of woomer](./demo.gif)
+> **This is a fork** of [coffeeispower/woomer](https://github.com/coffeeispower/woomer)
+> with fixes for HiDPI / fractionally-scaled outputs and multi-monitor setups.
+> See [Fork fixes](#fork-fixes) below.
+
+## Fork fixes
+
+This fork carries the following fixes on top of upstream:
+
+- Correct fullscreen capture on fractionally-scaled outputs (e.g. 1.25/1.5 scaling).
+- Fixed spotlight and pan alignment on scaled outputs (the flashlight and the
+  dragged image now track the cursor correctly).
+- Fixed fullscreen coverage so the zoom surface spans the whole scaled output.
+- Fixed the cursor-spotlight bug on Hyprland and smoothed the spotlight transition.
+- Fixed image stitching and per-monitor image selection in multi-monitor setups.
+- Fixed the first-frame glitch on startup.
+- Dropped `libwayshot` in favour of `grim-rs` for screen capture.
 
 ## Controls
 
@@ -62,7 +77,7 @@ You can also install woomer using the nix flake:
 # flake.nix
 {
   inputs = {
-    woomer.url = "github:coffeeispower/woomer";
+    woomer.url = "github:sbulav/woomer";
     # .....
   }
   # ....
