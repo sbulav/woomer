@@ -5,10 +5,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
-    crane = {
-      url = "github:ipetkov/crane";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    crane.url = "github:ipetkov/crane";
 
     flake-utils.url = "github:numtide/flake-utils";
   };
@@ -43,13 +40,11 @@
             wayland
             glfw
             libgbm
-          ]) ++ (
-            with pkgs.xorg; [
-            libX11.dev
-            libXrandr.dev
-            libXinerama.dev
-            libXcursor.dev
-            libXi.dev
+            libx11.dev
+            libxrandr.dev
+            libxinerama.dev
+            libxcursor.dev
+            libxi.dev
           ]);
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
           LIBCLANG_PATH = pkgs.libclang.lib + "/lib/";
