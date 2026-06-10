@@ -17,12 +17,14 @@ const SPOTLIGHT_TINT: Color = Color::new(0x00, 0x00, 0x00, 190);
 ///
 /// A fullscreen surface is sized in *logical* pixels (e.g. 1280x720 at scale
 /// 1.5) but is backed by a device-pixel GL buffer at the monitor's native
-/// resolution (logical * scale = 1920x1080). raylib only discovers that buffer
-/// size when `FLAG_WINDOW_HIGHDPI` is set, and that flag is broken on this
-/// GLFW/Wayland build (it reports a garbage framebuffer size). So raylib leaves
-/// its GL viewport at the logical size, anchored bottom-left, and our content
-/// only covers the bottom-left ~2/3 of the screen. We use this scale to size the
-/// viewport to the real device buffer ourselves.
+/// resolution (logical * scale = 1920x1080). On this GLFW/Wayland build raylib
+/// renders 1:1 into device pixels (a logical-unit coordinate lands on the device
+/// pixel of the same number) but leaves its GL viewport at the *logical* size,
+/// so our scene only covers the bottom-left ~2/3 of the buffer. We use this
+/// scale both to widen the viewport to the real device buffer and to express all
+/// geometry, mouse input and shader uniforms in device pixels so everything
+/// stays aligned. (`FLAG_WINDOW_HIGHDPI` would normally surface the device size
+/// but is broken here — it reports a garbage framebuffer.)
 fn output_scale(output_name: &str) -> f32 {
     Monitors::get()
         .ok()
@@ -112,11 +114,10 @@ fn main() {
     let raw_pixels = screenshot.into_data();
 
     // Hyprland always sizes a fullscreen surface to the output's *logical* size
-    // (e.g. 1280x720 for a 1920x1080 panel at scale 1.5), and that logical space
-    // is also where it reports the mouse. We request the window at that logical
-    // size and drive all drawing, mouse handling and the shader in logical units;
-    // the only catch (the real device framebuffer being larger) is fixed up by
-    // overriding the GL viewport with the device framebuffer size each frame.
+    // (e.g. 1280x720 for a 1920x1080 panel at scale 1.5), so that is the size we
+    // request the window at. The real GL buffer behind it is the device size
+    // (logical * scale); we render the whole scene in device pixels and widen the
+    // GL viewport to match each frame (see `output_scale`).
     let logical_width = selected_output.geometry().width() as i32;
     let logical_height = selected_output.geometry().height() as i32;
 
@@ -125,8 +126,9 @@ fn main() {
     let fb_width = (logical_width as f32 * scale).round() as i32;
     let fb_height = (logical_height as f32 * scale).round() as i32;
 
-    // The initial cursor position is already in logical (output-local) space.
-    let mut spotlight_mouse_position = spotlight_mouse_position_logical;
+    // Everything downstream works in device pixels (see `output_scale`), so lift
+    // the logical-space initial cursor into that space too.
+    let mut spotlight_mouse_position = spotlight_mouse_position_logical * scale;
 
     let (mut rl, thread) = raylib::init()
         .title(env!("CARGO_BIN_NAME"))
@@ -161,11 +163,10 @@ fn main() {
         .load_texture_from_image(&thread, &screenshot_image)
         .expect("failed to load screenshot into a texture");
 
-    // Draw the full-resolution capture stretched into the logical window; the
-    // enlarged GL viewport (see the loop below) then scales that up to the real
-    // device framebuffer so it fills the whole screen and stays sharp.
+    // Draw the full-resolution capture across the entire device framebuffer so
+    // it fills the screen and stays sharp.
     let texture_src = Rectangle::new(0.0, 0.0, capture_width as f32, capture_height as f32);
-    let texture_dst = Rectangle::new(0.0, 0.0, logical_width as f32, logical_height as f32);
+    let texture_dst = Rectangle::new(0.0, 0.0, fb_width as f32, fb_height as f32);
 
     #[cfg(feature = "dev")]
     let mut spotlight_shader = rl
@@ -180,7 +181,7 @@ fn main() {
     rl_camera.zoom = 1.0;
 
     let mut delta_scale = 0f64;
-    let mut scale_pivot = rl.get_mouse_position();
+    let mut scale_pivot = rl.get_mouse_position() * scale;
     let mut velocity = Vector2::default();
     let mut spotlight_radius_multiplier = 1.0;
     let mut spotlight_radius_multiplier_delta = 0.0;
@@ -218,8 +219,10 @@ fn main() {
     // is the screenshot, not an empty/unstyled window.
     {
         let mut d = rl.begin_drawing(&thread);
-        unsafe { ffi::rlViewport(0, 0, fb_width, fb_height) };
         let mut mode2d = d.begin_mode2D(rl_camera);
+        // raylib leaves the viewport at the logical size; widen it to the real
+        // device buffer so the scene fills the whole screen.
+        unsafe { ffi::rlViewport(0, 0, fb_width, fb_height) };
         mode2d.clear_background(Color::get_color(0));
         mode2d.draw_texture_pro(
             &screenshot_texture,
@@ -312,9 +315,10 @@ fn main() {
 
         const VELOCITY_THRESHOLD: f32 = 15.0;
         if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
-            let delta = rl
-                .get_screen_to_world2D(rl.get_mouse_position() - rl.get_mouse_delta(), rl_camera)
-                - rl.get_screen_to_world2D(rl.get_mouse_position(), rl_camera);
+            let mouse = rl.get_mouse_position() * scale;
+            let prev_mouse = (rl.get_mouse_position() - rl.get_mouse_delta()) * scale;
+            let delta = rl.get_screen_to_world2D(prev_mouse, rl_camera)
+                - rl.get_screen_to_world2D(mouse, rl_camera);
 
             rl_camera.target += delta;
             velocity = delta * rl.get_fps().as_f32();
@@ -324,17 +328,15 @@ fn main() {
         }
 
         if rl.is_cursor_on_screen() {
-            spotlight_mouse_position = rl.get_screen_to_world2D(rl.get_mouse_position(), rl_camera);
+            spotlight_mouse_position =
+                rl.get_screen_to_world2D(rl.get_mouse_position() * scale, rl_camera);
         }
 
         let mut d = rl.begin_drawing(&thread);
-        // raylib leaves its GL viewport at the logical screen size; on a
-        // fractionally-scaled output the real framebuffer is larger, so force
-        // the viewport to cover it (re-asserted each frame in case a compositor
-        // resize event reset it). Projection stays logical, so the scene simply
-        // scales up to fill the screen.
-        unsafe { ffi::rlViewport(0, 0, fb_width, fb_height) };
         let mut mode2d = d.begin_mode2D(rl_camera);
+        // raylib leaves the viewport at the logical size; widen it to the real
+        // device buffer so the scene fills the whole screen.
+        unsafe { ffi::rlViewport(0, 0, fb_width, fb_height) };
 
         if enable_spotlight || spotlight_opacity > 0.001 {
             mode2d.clear_background(Color::get_color(0));
@@ -361,12 +363,12 @@ fn main() {
                 spotlight_radius_multiplier,
             );
             spotlight_shader.set_shader_value(camera_zoom_uniform_location, rl_camera.zoom);
-            // `fragTexCoord * textureSize` must land in the same logical space
-            // as `cursorPosition` (raylib's world space), so use the logical
-            // window size, not the raw capture size.
+            // `fragTexCoord * textureSize` must land in the same space as
+            // `cursorPosition` (raylib world space, which we drive in device
+            // pixels), so use the device framebuffer size, not the raw capture.
             spotlight_shader.set_shader_value(
                 texture_size_uniform_location,
-                Vector2::new(logical_width as f32, logical_height as f32),
+                Vector2::new(fb_width as f32, fb_height as f32),
             );
 
             let mut shader_mode = mode2d.begin_shader_mode(&mut spotlight_shader);
