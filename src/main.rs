@@ -1,6 +1,6 @@
 use std::{env, process};
 
-use grim_rs::Grim;
+use grim_rs::{Grim, Output};
 use hyprland::{
     data::{CursorPosition, Monitors},
     prelude::*,
@@ -38,6 +38,33 @@ fn output_scale(output_name: &str) -> f32 {
         })
         .filter(|s| *s > 0.0)
         .unwrap_or(1.0)
+}
+
+/// Pick the output the user is actually working on, used when no `--monitor` is
+/// given. Wayland enumeration order is arbitrary, so `outputs[0]` is often an
+/// idle monitor; prefer Hyprland's focused monitor (matched by name to dodge any
+/// logical-vs-device coordinate mismatch between the two libraries), fall back to
+/// the output containing the cursor, then to the first enumerated output.
+fn active_output(outputs: &[Output]) -> &Output {
+    if let Ok(monitors) = Monitors::get() {
+        if let Some(name) = monitors.into_iter().find(|m| m.focused).map(|m| m.name) {
+            if let Some(out) = outputs.iter().find(|o| o.name() == name) {
+                return out;
+            }
+        }
+    }
+
+    if let Ok(pos) = CursorPosition::get() {
+        let (x, y) = (pos.x as i32, pos.y as i32);
+        if let Some(out) = outputs.iter().find(|o| {
+            let g = o.geometry();
+            x >= g.x() && x < g.x() + g.width() && y >= g.y() && y < g.y() + g.height()
+        }) {
+            return out;
+        }
+    }
+
+    &outputs[0]
 }
 
 fn get_initial_cursor_pos_for_output(
@@ -83,7 +110,7 @@ fn main() {
     }
 
     let selected_output = match monitor_name {
-        None => &outputs[0],
+        None => active_output(&outputs),
         Some(ref name) => outputs
             .iter()
             .find(|out| out.name() == name)
