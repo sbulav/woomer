@@ -10,12 +10,8 @@ uniform vec4 colDiffuse;
 
 uniform vec4 spotlightTint;
 uniform vec2 cursorPosition;
-uniform float spotlightRadiusMultiplier;
-uniform float cameraZoom;
+uniform float spotlightRadiusSquared;
 uniform vec2 textureSize;
-
-// This is multiplied by spotlightRadiusMultiplier to obtain the radius in pixels
-const int UNIT_RADIUS = 60;
 
 // Output fragment color
 out vec4 finalColor;
@@ -27,11 +23,9 @@ void main()
 
     // Compare in screenshot coordinates instead of framebuffer coordinates.
     vec2 imagePosition = fragTexCoord * textureSize;
-    float distanceToCursor = distance(imagePosition, cursorPosition);
+    vec2 cursorDelta = imagePosition - cursorPosition;
 
-    // Keep the visible spotlight radius stable while zooming.
-    float spotlightRadius = float(UNIT_RADIUS) * spotlightRadiusMultiplier / cameraZoom;
-    if (distanceToCursor > spotlightRadius)  {
+    if (dot(cursorDelta, cursorDelta) > spotlightRadiusSquared)  {
         finalColor = (mix(texelColor, vec4(spotlightTint.rgb, 1.0), spotlightTint.a) * colDiffuse);
     } else {
         finalColor = (texelColor * colDiffuse);

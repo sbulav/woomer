@@ -57,16 +57,16 @@ Dependencies:
 - rust
 - wayland-client
 
-Like with any other rust program you can run:
+For normal use, build the optimized release binary:
 
 ```sh
-cargo b
+cargo build --release
 ```
 
 However if you want hot reloading of the spotlight shader you can add the `dev` feature:
 
 ```sh
-cargo b -F dev
+cargo build --release -F dev
 ```
 
 ## Installing using the Nix flake
