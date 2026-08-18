@@ -1,6 +1,8 @@
-use std::{env, ffi::CStr, process};
+mod capture;
 
-use grim_rs::{Grim, Output};
+use std::{env, ffi::CStr, process, thread};
+
+use capture::{Output, Screencopy};
 use hyprland::{
     data::{CursorPosition, Monitor, Monitors},
     prelude::*,
@@ -225,6 +227,47 @@ fn get_initial_cursor_pos_for_output(
     ))
 }
 
+// GLFW loads libdecor (which drags in its GTK plugin) on Wayland even for
+// undecorated windows; this init hint disables it. Not exposed by raylib, but
+// GLFW is linked as a shared library so the symbol is reachable directly.
+const GLFW_WAYLAND_LIBDECOR: i32 = 0x0005_3001;
+const GLFW_WAYLAND_DISABLE_LIBDECOR: i32 = 0x0003_8002;
+extern "C" {
+    fn glfwInitHint(hint: i32, value: i32);
+}
+
+// No-op shims for GLFW's joystick API. raylib force-initializes the joystick
+// subsystem inside InitWindow, making GLFW open and close every
+// /dev/input/event* device before the window appears — 10-25ms per device
+// (~250ms total) on this machine. Gamepads are useless for a screen zoomer, so
+// these definitions shadow the shared-library symbols at link time (definitions
+// in the executable win over libglfw.so) and raylib's calls become free. These
+// five are the only joystick entry points raylib references; the state-reading
+// ones are all gated on glfwJoystickPresent returning true, so returning
+// "no joysticks" keeps every code path consistent.
+#[no_mangle]
+pub extern "C" fn glfwSetJoystickCallback(
+    _callback: Option<extern "C" fn(i32, i32)>,
+) -> Option<extern "C" fn(i32, i32)> {
+    None
+}
+#[no_mangle]
+pub extern "C" fn glfwJoystickPresent(_joystick_id: i32) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn glfwGetJoystickName(_joystick_id: i32) -> *const std::ffi::c_char {
+    std::ptr::null()
+}
+#[no_mangle]
+pub extern "C" fn glfwGetGamepadState(_joystick_id: i32, _state: *mut std::ffi::c_void) -> i32 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn glfwUpdateGamepadMappings(_mappings: *const std::ffi::c_char) -> i32 {
+    0
+}
+
 fn raylib_monitor_index(selected_output: &Output, outputs: &[Output]) -> Option<i32> {
     let monitor_count = unsafe { ffi::GetMonitorCount() };
 
@@ -272,8 +315,8 @@ fn main() {
         }
     }
 
-    let mut grim = Grim::new().expect("failed to initialize grim-rs");
-    let outputs = grim.get_outputs().expect("failed to get outputs");
+    let mut screencopy = Screencopy::new().expect("failed to initialize screen capture");
+    let outputs = screencopy.outputs();
 
     if outputs.is_empty() {
         eprintln!("No Wayland outputs found.");
@@ -310,16 +353,16 @@ fn main() {
         selected_output.geometry().height() as f32 * 0.5,
     ));
 
-    let screenshot = grim
-        .capture_output(selected_output.name())
-        .expect("failed to capture output");
-    // `grim` captures at the output's full device pixel resolution, which on a
-    // fractionally-scaled output is even larger than the monitor's mode (e.g.
-    // 2880x1620 for a 1920x1080 panel at scale 1.5). We keep this full-res
-    // texture for crisp zooming and just draw it scaled to the logical window.
-    let capture_width = screenshot.width();
-    let capture_height = screenshot.height();
-    let mut raw_pixels = screenshot.into_data();
+    // Capture on a worker thread so the (tens of ms) screencopy roundtrip
+    // overlaps raylib's much slower window/GL init below. This cannot capture
+    // woomer's own window: the surface is only mapped on the first buffer swap,
+    // which happens after the capture is joined and drawn.
+    let capture_output_name = selected_output.name().to_string();
+    let capture_thread = thread::spawn(move || {
+        screencopy
+            .capture_output(&capture_output_name)
+            .expect("failed to capture output")
+    });
 
     // Hyprland always sizes a fullscreen surface to the output's *logical* size
     // (e.g. 1280x720 for a 1920x1080 panel at scale 1.5), so that is the size we
@@ -339,6 +382,9 @@ fn main() {
     // build, so live cursor reads need no conversion; only this initial position,
     // which comes from Hyprland's *logical* `cursorpos`, must be lifted to device.
     let mut spotlight_mouse_position = spotlight_mouse_position_logical * scale;
+
+    // Must run before raylib calls glfwInit.
+    unsafe { glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_WAYLAND_DISABLE_LIBDECOR) };
 
     let (mut rl, thread) = raylib::init()
         .title(env!("CARGO_BIN_NAME"))
@@ -361,13 +407,20 @@ fn main() {
         SetWindowMonitor(monitor_index);
     }
 
+    // `grim` captures at the output's full device pixel resolution, which on a
+    // fractionally-scaled output is even larger than the monitor's mode (e.g.
+    // 2880x1620 for a 1920x1080 panel at scale 1.5). We keep this full-res
+    // texture for crisp zooming and just draw it scaled to the logical window.
+    let (capture_width, capture_height, mut raw_pixels) = capture_thread
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
     let screenshot_texture = load_rgba_texture(&mut raw_pixels, capture_width, capture_height)
         .unwrap_or_else(|error| {
             eprintln!("failed to load screenshot into a texture: {error}");
             process::exit(1);
         });
     drop(raw_pixels);
-    drop(grim);
 
     // Draw the full-resolution capture across the entire device framebuffer so
     // it fills the screen and stays sharp.

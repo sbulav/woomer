@@ -6,9 +6,19 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-grim-rs = { version = "0.1.6", default-features = false, features = ["png_support"] }
 hyprland = { version = "0.4.0-beta.3", default-features = false, features = ["data"] }
 raylib = { version = "5.5.1", features = ["wayland", "opengl_33"] }
+# rustix 0.38 to share the build wayland-backend already requires.
+rustix = { version = "0.38", features = ["fs"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [features]
 dev = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
