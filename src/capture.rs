@@ -142,6 +142,10 @@ struct FrameState {
     // (width, height, stride, format) of the first supported buffer layout the
     // compositor advertises.
     params: Option<(u32, u32, u32, ShmFormat)>,
+    // Whether any buffer layout was advertised, supported or not. Protocol
+    // versions below 3 have no `buffer_done`, so this is the only signal that
+    // the compositor is done offering formats.
+    saw_buffer: bool,
     all_params_received: bool,
     y_invert: bool,
     ready: bool,
@@ -226,14 +230,12 @@ impl Screencopy {
                 if state.failed {
                     return Err("compositor failed to capture the output".to_string());
                 }
-                if state.all_params_received || (!has_buffer_done && state.params.is_some()) {
+                if state.all_params_received || (!has_buffer_done && state.saw_buffer) {
                     match state.params {
                         Some(params) => break params,
                         None => {
-                            return Err(
-                                "compositor offered no supported screencopy buffer format"
-                                    .to_string(),
-                            )
+                            return Err("compositor offered no supported screencopy buffer format"
+                                .to_string())
                         }
                     }
                 }
@@ -242,6 +244,22 @@ impl Screencopy {
                 .blocking_dispatch(&mut self.state)
                 .map_err(|error| format!("Wayland dispatch failed: {error}"))?;
         };
+
+        // The row-unpadding and transform passes below index by these values,
+        // so reject anything malformed here rather than panicking there.
+        if width == 0 || height == 0 {
+            return Err(format!(
+                "compositor advertised an empty capture buffer ({width}x{height})"
+            ));
+        }
+        let row_bytes = (width as u64)
+            .checked_mul(4)
+            .ok_or("screencopy row size overflow")?;
+        if (stride as u64) < row_bytes {
+            return Err(format!(
+                "compositor advertised stride {stride}, below the {row_bytes} bytes a {width}px row needs"
+            ));
+        }
 
         let size = (stride as u64)
             .checked_mul(height as u64)
@@ -291,7 +309,7 @@ impl Screencopy {
             .map_err(|error| format!("failed to read shared memory buffer: {error}"))?;
 
         // Drop any per-row padding the compositor required.
-        let row_bytes = width as usize * 4;
+        let row_bytes = row_bytes as usize;
         if stride as usize != row_bytes {
             for row in 1..height as usize {
                 data.copy_within(
@@ -304,18 +322,25 @@ impl Screencopy {
 
         convert_to_rgba(&mut data, format);
 
-        // The buffer is in the output's native (pre-transform) orientation;
-        // undo the output transform so the image matches what is on screen.
-        let (mut data, width, height) = apply_transform(data, width, height, transform);
+        // `y_invert` describes the row order of the *captured* buffer, so undo
+        // it in that buffer's own space. It has to happen before the transform:
+        // under a 90/270-degree transform a vertical flip of the source is a
+        // horizontal flip of the result, so the two do not commute.
         if y_invert {
             flip_vertical_in_place(&mut data, width, height);
         }
+
+        // The buffer is in the output's native (pre-transform) orientation;
+        // undo the output transform so the image matches what is on screen.
+        let (data, width, height) = apply_transform(data, width, height, transform);
 
         Ok((width, height, data))
     }
 }
 
-fn lock_frame(frame_state: &Arc<Mutex<FrameState>>) -> Result<std::sync::MutexGuard<'_, FrameState>, String> {
+fn lock_frame(
+    frame_state: &Arc<Mutex<FrameState>>,
+) -> Result<std::sync::MutexGuard<'_, FrameState>, String> {
     frame_state
         .lock()
         .map_err(|_| "screencopy frame state poisoned".to_string())
@@ -386,7 +411,12 @@ fn convert_to_rgba(data: &mut [u8], format: ShmFormat) {
 
 /// Undo an output transform: map every source pixel to where it appears on
 /// screen. 90/270-degree cases swap the image dimensions.
-fn apply_transform(data: Vec<u8>, width: u32, height: u32, transform: Transform) -> (Vec<u8>, u32, u32) {
+fn apply_transform(
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    transform: Transform,
+) -> (Vec<u8>, u32, u32) {
     let (swap_axes, mirror_x, mirror_y) = match transform {
         Transform::Normal => return (data, width, height),
         Transform::_90 => (true, true, false),
@@ -399,7 +429,11 @@ fn apply_transform(data: Vec<u8>, width: u32, height: u32, transform: Transform)
         _ => return (data, width, height),
     };
 
-    let (new_width, new_height) = if swap_axes { (height, width) } else { (width, height) };
+    let (new_width, new_height) = if swap_axes {
+        (height, width)
+    } else {
+        (width, height)
+    };
     let mut out = vec![0u8; data.len()];
     for y in 0..height as usize {
         for x in 0..width as usize {
@@ -521,7 +555,14 @@ impl Dispatch<WlOutput, ()> for State {
                     entry.transform = transform;
                 }
             }
-            wl_output::Event::Mode { width, height, .. } => {
+            // Outputs advertise every mode they support; only the one flagged
+            // `current` describes the resolution in use.
+            wl_output::Event::Mode {
+                flags: WEnum::Value(flags),
+                width,
+                height,
+                ..
+            } if flags.contains(wl_output::Mode::Current) => {
                 entry.mode_width = width;
                 entry.mode_height = height;
             }
@@ -589,12 +630,19 @@ impl Dispatch<ZwlrScreencopyFrameV1, Arc<Mutex<FrameState>>> for State {
 
         match event {
             zwlr_screencopy_frame_v1::Event::Buffer {
-                format: WEnum::Value(format),
+                format,
                 width,
                 height,
                 stride,
-            } if state.params.is_none() && is_supported_format(format) => {
-                state.params = Some((width, height, stride, format));
+            } => {
+                state.saw_buffer = true;
+                if state.params.is_none() {
+                    if let WEnum::Value(format) = format {
+                        if is_supported_format(format) {
+                            state.params = Some((width, height, stride, format));
+                        }
+                    }
+                }
             }
             zwlr_screencopy_frame_v1::Event::BufferDone => {
                 state.all_params_received = true;
@@ -620,3 +668,193 @@ wayland_client::delegate_noop!(State: ignore WlShmPool);
 wayland_client::delegate_noop!(State: ignore WlBuffer);
 wayland_client::delegate_noop!(State: ignore ZwlrScreencopyManagerV1);
 wayland_client::delegate_noop!(State: ignore ZxdgOutputManagerV1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One pixel, as it sits in memory for the given format.
+    fn convert(bytes: [u8; 4], format: ShmFormat) -> [u8; 4] {
+        let mut data = bytes;
+        convert_to_rgba(&mut data, format);
+        data
+    }
+
+    #[test]
+    fn converts_every_supported_8_bit_format_to_rgba() {
+        // A distinguishable pixel: R=0x11, G=0x22, B=0x33, A=0x44.
+        // wl_shm names are little-endian words, so the byte order is reversed.
+        assert_eq!(
+            convert([0x33, 0x22, 0x11, 0x44], ShmFormat::Xrgb8888),
+            [0x11, 0x22, 0x33, 0xff],
+            "xrgb is B,G,R,x in memory and has no alpha"
+        );
+        assert_eq!(
+            convert([0x33, 0x22, 0x11, 0x44], ShmFormat::Argb8888),
+            [0x11, 0x22, 0x33, 0x44]
+        );
+        assert_eq!(
+            convert([0x11, 0x22, 0x33, 0x44], ShmFormat::Xbgr8888),
+            [0x11, 0x22, 0x33, 0xff],
+            "xbgr is already R,G,B in memory but has no alpha"
+        );
+        assert_eq!(
+            convert([0x11, 0x22, 0x33, 0x44], ShmFormat::Abgr8888),
+            [0x11, 0x22, 0x33, 0x44],
+            "abgr is already RGBA"
+        );
+    }
+
+    #[test]
+    fn converts_every_supported_10_bit_format_to_rgba() {
+        // Pack three 10-bit channels plus 2 bits of alpha, low channel first.
+        fn pack(low: u32, mid: u32, high: u32, alpha: u32) -> [u8; 4] {
+            (low | (mid << 10) | (high << 20) | (alpha << 30)).to_le_bytes()
+        }
+        // 10-bit values chosen so >> 2 lands on the 8-bit values above.
+        let (r10, g10, b10) = (0x11 << 2, 0x22 << 2, 0x33 << 2);
+
+        // *rgb2101010 stores B in the low bits and R in the high bits.
+        assert_eq!(
+            convert(pack(b10, g10, r10, 0), ShmFormat::Xrgb2101010),
+            [0x11, 0x22, 0x33, 0xff]
+        );
+        assert_eq!(
+            convert(pack(b10, g10, r10, 3), ShmFormat::Argb2101010),
+            [0x11, 0x22, 0x33, 255],
+            "2-bit alpha 3 scales to fully opaque"
+        );
+        // *bgr2101010 stores R in the low bits.
+        assert_eq!(
+            convert(pack(r10, g10, b10, 0), ShmFormat::Xbgr2101010),
+            [0x11, 0x22, 0x33, 0xff]
+        );
+        assert_eq!(
+            convert(pack(r10, g10, b10, 1), ShmFormat::Abgr2101010),
+            [0x11, 0x22, 0x33, 85],
+            "2-bit alpha 1 scales to 85"
+        );
+    }
+
+    /// A 2x3 image (width 2, height 3) whose pixels are numbered 1..=6 in
+    /// row-major order, encoded one byte per channel so it is easy to read.
+    fn sample() -> (Vec<u8>, u32, u32) {
+        let mut data = Vec::new();
+        for value in 1..=6u8 {
+            data.extend_from_slice(&[value, value, value, 255]);
+        }
+        (data, 2, 3)
+    }
+
+    /// Collapse an RGBA buffer back to its per-pixel marker values.
+    fn markers(data: &[u8]) -> Vec<u8> {
+        data.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+
+    #[test]
+    fn transform_normal_is_the_identity() {
+        let (data, width, height) = sample();
+        let (out, w, h) = apply_transform(data, width, height, Transform::Normal);
+        assert_eq!((w, h), (2, 3));
+        assert_eq!(markers(&out), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn transform_180_rotates_in_place() {
+        let (data, width, height) = sample();
+        let (out, w, h) = apply_transform(data, width, height, Transform::_180);
+        assert_eq!((w, h), (2, 3));
+        assert_eq!(markers(&out), vec![6, 5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn transform_90_swaps_the_axes() {
+        let (data, width, height) = sample();
+        let (out, w, h) = apply_transform(data, width, height, Transform::_90);
+        assert_eq!((w, h), (3, 2), "90 degrees swaps width and height");
+        // Source rows [1 2] [3 4] [5 6] become columns, right to left.
+        assert_eq!(markers(&out), vec![5, 3, 1, 6, 4, 2]);
+    }
+
+    #[test]
+    fn transform_270_is_the_inverse_of_90() {
+        let (data, width, height) = sample();
+        let (once, w, h) = apply_transform(data.clone(), width, height, Transform::_90);
+        let (twice, w2, h2) = apply_transform(once, w, h, Transform::_270);
+        assert_eq!((w2, h2), (width, height));
+        assert_eq!(markers(&twice), markers(&data));
+    }
+
+    #[test]
+    fn transform_flipped_mirrors_horizontally() {
+        let (data, width, height) = sample();
+        let (out, w, h) = apply_transform(data, width, height, Transform::Flipped);
+        assert_eq!((w, h), (2, 3));
+        assert_eq!(markers(&out), vec![2, 1, 4, 3, 6, 5]);
+    }
+
+    #[test]
+    fn flip_vertical_reverses_row_order() {
+        let (mut data, width, height) = sample();
+        flip_vertical_in_place(&mut data, width, height);
+        assert_eq!(markers(&data), vec![5, 6, 3, 4, 1, 2]);
+    }
+
+    #[test]
+    fn flip_vertical_leaves_the_middle_row_of_an_odd_image_alone() {
+        let (mut data, width, height) = sample();
+        flip_vertical_in_place(&mut data, width, height);
+        flip_vertical_in_place(&mut data, width, height);
+        assert_eq!(
+            markers(&data),
+            vec![1, 2, 3, 4, 5, 6],
+            "flipping twice is a no-op"
+        );
+    }
+
+    /// `y_invert` describes the captured buffer, so the flip must be undone in
+    /// source space. Under a 90-degree transform the two orders differ, which
+    /// is what makes the ordering load-bearing rather than cosmetic.
+    #[test]
+    fn flip_then_transform_differs_from_transform_then_flip_at_90_degrees() {
+        let (data, width, height) = sample();
+
+        // Correct order: undo y_invert in the source buffer, then transform.
+        let mut flipped = data.clone();
+        flip_vertical_in_place(&mut flipped, width, height);
+        let (correct, w, h) = apply_transform(flipped, width, height, Transform::_90);
+
+        // Wrong order: transform first, then flip the already-rotated result.
+        let (mut wrong, ww, wh) = apply_transform(data, width, height, Transform::_90);
+        flip_vertical_in_place(&mut wrong, ww, wh);
+
+        assert_eq!((w, h), (ww, wh));
+        assert_eq!(markers(&correct), vec![1, 3, 5, 2, 4, 6]);
+        // The old order lands a full 180 degrees away from the right answer.
+        assert_eq!(markers(&wrong), vec![6, 4, 2, 5, 3, 1]);
+        assert_ne!(markers(&correct), markers(&wrong));
+    }
+
+    /// ...while for the non-axis-swapping transforms they agree, which is why
+    /// the bug was invisible on every unrotated output.
+    #[test]
+    fn flip_and_transform_commute_when_the_axes_are_not_swapped() {
+        for transform in [
+            Transform::Normal,
+            Transform::_180,
+            Transform::Flipped,
+            Transform::Flipped180,
+        ] {
+            let (data, width, height) = sample();
+
+            let mut flipped = data.clone();
+            flip_vertical_in_place(&mut flipped, width, height);
+            let (first, _, _) = apply_transform(flipped, width, height, transform);
+
+            let (mut second, w, h) = apply_transform(data, width, height, transform);
+            flip_vertical_in_place(&mut second, w, h);
+
+            assert_eq!(markers(&first), markers(&second), "{transform:?}");
+        }
+    }
+}
