@@ -27,6 +27,8 @@ This fork carries the following fixes on top of upstream:
 | <kbd>R</kbd>                                              | Reload the shaders (only for Developer mode) |
 | Hold <kbd>CTRL</kbd>                                      | Enable flashlight effect.                    |
 | Drag with left mouse button                               | Move the image around.                       |
+| Drag with middle mouse button                             | Draw a fading freehand stroke.               |
+| Click middle mouse button                                 | Drop a fading pointer dot.                   |
 | Scroll wheel                                              | Zoom in/out.                                 |
 | <kbd>Ctrl</kbd> + <kbd>SHIFT</kbd> + Scroll wheel         | Change the radius of the flashlight.         |
 

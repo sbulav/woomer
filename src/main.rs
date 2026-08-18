@@ -8,12 +8,36 @@ use hyprland::{
 use raylib::{ffi, ffi::SetWindowMonitor, prelude::*};
 
 const SPOTLIGHT_TINT: Color = Color::new(0x00, 0x00, 0x00, 190);
-const SPOTLIGHT_UNIT_RADIUS: f32 = 60.0;
+const SPOTLIGHT_UNIT_RADIUS: f32 = 100.0;
 const MAX_FRAME_TIME: f32 = 1.0 / 15.0;
 const ANIMATION_EPSILON: f32 = 0.001;
+const STROKE_COLOR: Color = Color::new(230, 41, 55, 255);
+// Logical pixels; multiplied by the output scale into device pixels.
+const STROKE_BASE_THICKNESS: f32 = 4.0;
+const STROKE_FADE_SECONDS: f64 = 3.0;
+// Skip points closer than this (device pixels) to keep strokes sparse.
+const STROKE_MIN_SEGMENT_LENGTH: f32 = 2.0;
+const POINTER_DOT_RADIUS_FACTOR: f32 = 2.5;
 #[cfg(feature = "dev")]
 const DEV_SPOTLIGHT_SHADER_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/spotlight.fs");
+
+/// A freehand annotation drawn with the middle mouse button. Points live in
+/// image-space (the camera's world coordinates), so strokes pan and zoom with
+/// the content. A single-point stroke renders as a pointer dot.
+struct Stroke {
+    points: Vec<Vector2>,
+    released_at: Option<f64>,
+}
+
+/// 1.0 while the stroke is being drawn, then a linear fade to 0.0 over
+/// `STROKE_FADE_SECONDS` after release.
+fn stroke_alpha(now: f64, released_at: Option<f64>) -> f32 {
+    match released_at {
+        None => 1.0,
+        Some(released) => (1.0 - (now - released) / STROKE_FADE_SECONDS).clamp(0.0, 1.0) as f32,
+    }
+}
 
 #[derive(Clone, Copy)]
 struct SpotlightUniforms {
@@ -368,6 +392,8 @@ fn main() {
     let mut spotlight_radius_multiplier = 1.0;
     let mut spotlight_radius_multiplier_delta = 0.0f32;
     let mut spotlight_opacity = 0.0f32;
+    let mut strokes: Vec<Stroke> = Vec::new();
+    let stroke_thickness_device = STROKE_BASE_THICKNESS * scale;
 
     let spotlight_uniforms = configure_spotlight_shader(
         &mut spotlight_shader,
@@ -508,11 +534,37 @@ fn main() {
             spotlight_mouse_position = rl.get_screen_to_world2D(mouse_position, rl_camera);
         }
 
+        let now = rl.get_time();
+        let world_mouse = spotlight_mouse_position;
+        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_MIDDLE) {
+            strokes.push(Stroke {
+                points: vec![world_mouse],
+                released_at: None,
+            });
+        } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_MIDDLE) {
+            if let Some(stroke) = strokes.last_mut().filter(|s| s.released_at.is_none()) {
+                let far_enough = stroke.points.last().is_none_or(|last| {
+                    (*last - world_mouse).length_sqr()
+                        >= STROKE_MIN_SEGMENT_LENGTH * STROKE_MIN_SEGMENT_LENGTH
+                });
+                if far_enough {
+                    stroke.points.push(world_mouse);
+                }
+            }
+        } else if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_MIDDLE) {
+            if let Some(stroke) = strokes.last_mut().filter(|s| s.released_at.is_none()) {
+                stroke.released_at = Some(now);
+            }
+        }
+        strokes.retain(|s| stroke_alpha(now, s.released_at) > 0.0);
+
         let animation_active = dragging
             || delta_scale != 0.0
             || spotlight_radius_multiplier_delta != 0.0
             || velocity != Vector2::zero()
-            || (target_opacity - spotlight_opacity).abs() >= ANIMATION_EPSILON;
+            || (target_opacity - spotlight_opacity).abs() >= ANIMATION_EPSILON
+            // Fading strokes need continuous frames, not event-driven ones.
+            || !strokes.is_empty();
         unsafe {
             if animation_active {
                 ffi::DisableEventWaiting();
@@ -571,6 +623,23 @@ fn main() {
                 0.0,
                 Color::WHITE,
             );
+        }
+
+        // Constant on-screen thickness regardless of zoom.
+        let thickness = stroke_thickness_device / rl_camera.zoom;
+        for stroke in &strokes {
+            let color = STROKE_COLOR.alpha(stroke_alpha(now, stroke.released_at));
+            if let [point] = stroke.points.as_slice() {
+                mode2d.draw_circle_v(*point, thickness * POINTER_DOT_RADIUS_FACTOR, color);
+                continue;
+            }
+            for pair in stroke.points.windows(2) {
+                mode2d.draw_line_ex(pair[0], pair[1], thickness, color);
+            }
+            // Round joins and caps.
+            for point in &stroke.points {
+                mode2d.draw_circle_v(*point, thickness * 0.5, color);
+            }
         }
     }
 }
@@ -640,6 +709,20 @@ mod tests {
         apply_scroll(1.0, true, true, &mut zoom_delta, &mut radius_delta);
         assert_eq!(zoom_delta, 0.0);
         assert_eq!(radius_delta, -1.0);
+    }
+
+    #[test]
+    fn stroke_is_opaque_while_being_drawn() {
+        assert_eq!(stroke_alpha(1000.0, None), 1.0);
+    }
+
+    #[test]
+    fn stroke_fades_linearly_after_release() {
+        assert_eq!(stroke_alpha(10.0, Some(10.0)), 1.0);
+        let midway = stroke_alpha(10.0 + STROKE_FADE_SECONDS / 2.0, Some(10.0));
+        assert!((midway - 0.5).abs() < 0.0001);
+        assert_eq!(stroke_alpha(10.0 + STROKE_FADE_SECONDS, Some(10.0)), 0.0);
+        assert_eq!(stroke_alpha(10.0 + STROKE_FADE_SECONDS * 2.0, Some(10.0)), 0.0);
     }
 
     #[test]
