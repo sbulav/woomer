@@ -153,14 +153,13 @@ fn configure_spotlight_shader(
 ///
 /// A fullscreen surface is sized in *logical* pixels (e.g. 1280x720 at scale
 /// 1.5) but is backed by a device-pixel GL buffer at the monitor's native
-/// resolution (logical * scale = 1920x1080). On this GLFW/Wayland build raylib
-/// renders 1:1 into device pixels (a logical-unit coordinate lands on the device
-/// pixel of the same number) but leaves its GL viewport at the *logical* size,
-/// so our scene only covers the bottom-left ~2/3 of the buffer. We use this
-/// scale to widen the viewport to the real device buffer and to size the
-/// geometry and shader uniforms in device pixels so everything stays aligned.
-/// (`get_mouse_position` already reports device pixels on this build, so live
-/// cursor reads are used as-is; only Hyprland's logical `cursorpos` is scaled.)
+/// resolution (logical * scale = 1920x1080). raylib knows nothing about that
+/// buffer: it sizes both its GL viewport and its projection from the logical
+/// window size. We use this scale to retarget both at the device buffer (see
+/// `use_device_pixel_framebuffer`) and to size the geometry and shader uniforms
+/// in device pixels, so one drawing unit is exactly one device pixel.
+/// GLFW still reports the cursor in logical pixels, so every mouse read is
+/// multiplied by this scale to reach the same space.
 /// (`FLAG_WINDOW_HIGHDPI` would normally surface the device size but is broken
 /// here — it reports a garbage framebuffer.)
 fn output_scale(output_name: &str, monitors: Option<&[Monitor]>) -> f32 {
@@ -266,6 +265,27 @@ pub extern "C" fn glfwGetGamepadState(_joystick_id: i32, _state: *mut std::ffi::
 #[no_mangle]
 pub extern "C" fn glfwUpdateGamepadMappings(_mappings: *const std::ffi::c_char) -> i32 {
     0
+}
+
+// raylib sizes both its GL viewport and its projection from the window's
+// *logical* size, but the framebuffer behind a fullscreen Wayland surface is
+// `logical * scale` device pixels. Widening only the viewport (as the drawing
+// code used to) leaves the projection covering the logical size, which scales
+// every coordinate up by `scale` and pushes all but the top-left corner of the
+// scene off screen. Widen both so one drawing unit is exactly one device pixel.
+fn use_device_pixel_framebuffer(fb_width: i32, fb_height: i32) {
+    const RL_PROJECTION: i32 = 0x1701;
+    const RL_MODELVIEW: i32 = 0x1700;
+
+    unsafe {
+        ffi::rlViewport(0, 0, fb_width, fb_height);
+        ffi::rlMatrixMode(RL_PROJECTION);
+        ffi::rlLoadIdentity();
+        ffi::rlOrtho(0.0, fb_width as f64, fb_height as f64, 0.0, 0.0, 1.0);
+        // Leave the modelview selected (and untouched) so `begin_mode2D`'s
+        // camera matrix stays in effect.
+        ffi::rlMatrixMode(RL_MODELVIEW);
+    }
 }
 
 fn raylib_monitor_index(selected_output: &Output, outputs: &[Output]) -> Option<i32> {
@@ -377,10 +397,8 @@ fn main() {
     let fb_width = (logical_width as f32 * scale).round() as i32;
     let fb_height = (logical_height as f32 * scale).round() as i32;
 
-    // Everything downstream works in device pixels (see `output_scale`).
-    // `get_mouse_position` already reports device pixels on this GLFW/Wayland
-    // build, so live cursor reads need no conversion; only this initial position,
-    // which comes from Hyprland's *logical* `cursorpos`, must be lifted to device.
+    // Everything downstream works in device pixels (see `output_scale`), so lift
+    // this initial position out of Hyprland's *logical* `cursorpos` space.
     let mut spotlight_mouse_position = spotlight_mouse_position_logical * scale;
 
     // Must run before raylib calls glfwInit.
@@ -407,10 +425,10 @@ fn main() {
         SetWindowMonitor(monitor_index);
     }
 
-    // `grim` captures at the output's full device pixel resolution, which on a
-    // fractionally-scaled output is even larger than the monitor's mode (e.g.
-    // 2880x1620 for a 1920x1080 panel at scale 1.5). We keep this full-res
-    // texture for crisp zooming and just draw it scaled to the logical window.
+    // The capture arrives at the output's full device-pixel resolution (e.g.
+    // 3840x2560 for a 1920x1280 logical surface at scale 2). We keep that
+    // full-res texture for crisp zooming and draw it across the whole
+    // device-pixel framebuffer.
     let (capture_width, capture_height, mut raw_pixels) = capture_thread
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -440,7 +458,9 @@ fn main() {
     };
 
     let mut delta_scale = 0.0f32;
-    let mut scale_pivot = rl.get_mouse_position();
+    // Device pixels, like every other mouse coordinate. GLFW reports (0, 0)
+    // until the first motion event, so seed from the compositor's cursor.
+    let mut scale_pivot = spotlight_mouse_position;
     let mut velocity = Vector2::default();
     let mut spotlight_radius_multiplier = 1.0;
     let mut spotlight_radius_multiplier_delta = 0.0f32;
@@ -464,9 +484,7 @@ fn main() {
     {
         let mut d = rl.begin_drawing(&thread);
         let mut mode2d = d.begin_mode2D(rl_camera);
-        // raylib leaves the viewport at the logical size; widen it to the real
-        // device buffer so the scene fills the whole screen.
-        unsafe { ffi::rlViewport(0, 0, fb_width, fb_height) };
+        use_device_pixel_framebuffer(fb_width, fb_height);
         mode2d.clear_background(Color::get_color(0));
         mode2d.draw_texture_pro(
             &screenshot_texture,
@@ -515,7 +533,11 @@ fn main() {
 
         let scrolled_amount = rl.get_mouse_wheel_move_v().y;
         let frame_time = rl.get_frame_time().clamp(0.0, MAX_FRAME_TIME);
-        let mouse_position = rl.get_mouse_position();
+        // GLFW reports the cursor in the surface's *logical* pixels, while the
+        // scene is in device pixels (see `output_scale`), so lift both the
+        // position and the drag delta.
+        let mouse_position = rl.get_mouse_position() * scale;
+        let mouse_delta = rl.get_mouse_delta() * scale;
 
         let target_opacity = if enable_spotlight {
             SPOTLIGHT_TINT.a as f32 / 255.0
@@ -570,7 +592,7 @@ fn main() {
         const VELOCITY_THRESHOLD: f32 = 15.0;
         let dragging = rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT);
         if dragging {
-            let prev_mouse = mouse_position - rl.get_mouse_delta();
+            let prev_mouse = mouse_position - mouse_delta;
             let delta = rl.get_screen_to_world2D(prev_mouse, rl_camera)
                 - rl.get_screen_to_world2D(mouse_position, rl_camera);
 
@@ -628,9 +650,7 @@ fn main() {
 
         let mut d = rl.begin_drawing(&thread);
         let mut mode2d = d.begin_mode2D(rl_camera);
-        // raylib leaves the viewport at the logical size; widen it to the real
-        // device buffer so the scene fills the whole screen.
-        unsafe { ffi::rlViewport(0, 0, fb_width, fb_height) };
+        use_device_pixel_framebuffer(fb_width, fb_height);
         mode2d.clear_background(Color::get_color(0));
 
         if enable_spotlight || spotlight_opacity > 0.001 {
@@ -775,7 +795,10 @@ mod tests {
         let midway = stroke_alpha(10.0 + STROKE_FADE_SECONDS / 2.0, Some(10.0));
         assert!((midway - 0.5).abs() < 0.0001);
         assert_eq!(stroke_alpha(10.0 + STROKE_FADE_SECONDS, Some(10.0)), 0.0);
-        assert_eq!(stroke_alpha(10.0 + STROKE_FADE_SECONDS * 2.0, Some(10.0)), 0.0);
+        assert_eq!(
+            stroke_alpha(10.0 + STROKE_FADE_SECONDS * 2.0, Some(10.0)),
+            0.0
+        );
     }
 
     #[test]
